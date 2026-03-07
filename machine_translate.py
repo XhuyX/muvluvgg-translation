@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -6,206 +7,261 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-# 1. .envからAPIキーを読み込む
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
-
 if not API_KEY:
-    raise ValueError("[!] LỖI: Không tìm thấy GEMINI_API_KEY. Hãy kiểm tra lại file .env!")
+    raise ValueError("Khong tim thay GEMINI_API_KEY!")
 
-# --- 構成設定 ---
 ROOT_FOLDER = r"D:\muvluvgg translate\muvluvgg-translation\translation"
-MODEL_ID = "gemini-2.0-flash-lite"
+MODEL_ID    = "gemini-2.0-flash-lite"
 MAX_WORKERS = 10
-MAX_RETRIES = 3
 
 client = genai.Client(api_key=API_KEY)
+
+# ==========================================
+# UTILS
+# ==========================================
+
+_CTRL  = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+# Hiragana + Katakana — neu xuat hien trong OUTPUT = chua dich duoc
+_JP    = re.compile(r'[\u3040-\u30ff]')
+# Kanji pho bien — de detect input tieng Nhat
+_KANJI = re.compile(r'[\u4e00-\u9fff]')
+
+def sanitize(text):
+    return _CTRL.sub('', str(text))
+
+def has_japanese(text):
+    """Kiem tra co Hiragana/Katakana khong."""
+    return bool(_JP.search(str(text)))
+
+def still_untranslated(val):
+    """
+    Kiem tra xem output co CHUA duoc dich khong.
+    Output hop le (tieng Viet) KHONG duoc chua Hiragana/Katakana.
+    """
+    return has_japanese(val)
+
+def repair_json(raw: str) -> str:
+    """Sua cac loi JSON pho bien tu AI output."""
+    raw = raw.strip()
+    # Strip markdown fences
+    raw = re.sub(r'^```(?:json)?\s*', '', raw)
+    raw = re.sub(r'\s*```$', '', raw)
+    raw = raw.strip()
+    # Fix invalid \uXXXX escapes
+    raw = re.sub(r'\\u(?![0-9a-fA-F]{4})', '', raw)
+    # Strip trailing commas
+    raw = re.sub(r',(\s*[}\]])', r'\1', raw)
+    return raw
+
 
 # ==========================================
 # PROMPTS
 # ==========================================
 
-# Dành cho scene files (Nhật → Việt)
 PROMPT_SCENE = (
-    "Bạn là dịch giả Visual Novel chuyên nghiệp (Nhật → Việt) cho game 'Muv-Luv Girls Garden' (Bối cảnh: Học viện Quân sự / Mecha Sci-fi).\n\n"
-
-    "=== OUTPUT FORMAT (TUYỆT ĐỐI TUÂN THỦ) ===\n"
-    "• Trả về ĐÚNG định dạng JSON Array chứa các chuỗi String. KHÔNG trả về định dạng [N] hay thêm text ngoài JSON.\n"
-    "• Trả về đúng N phần tử cho N input. Không thêm, không bớt, không gộp câu.\n"
-    "• KHÔNG dùng dấu nháy kép (\") bên trong câu thoại để tránh lỗi JSON. Dùng nháy đơn (') hoặc nháy Nhật (「」) nếu cần.\n"
-    "• KHÔNG đặt tên nhân vật vào đầu bản dịch.\n\n"
-
-    "=== CHẤT LƯỢNG DỊCH — ƯU TIÊN SỐ 1 ===\n"
-    "• Dịch như người Việt viết, không phải như máy dịch. Nếu dịch sát chữ nghe cứng → dịch thoát ý, giữ cảm xúc gốc.\n"
-    "• Tránh lạm dụng từ 'đã/được/bị', câu bị động, hoặc từ Hán-Việt nặng nề (Cấm dùng: Tại hạ, Tiểu nữ, Hỗn đản).\n"
-    "• Ưu tiên động từ có hình ảnh. Cấm tuyệt đối cấu trúc dịch 'một cách + [tính từ]'.\n\n"
-
-    "=== XƯNG HÔ (MUV-LUV) ===\n"
-    "• Nam chính (Ore/俺): BẮT BUỘC dịch là 'Tôi'. KHÔNG DÙNG 'Ta' hay 'Tớ'.\n"
-    "• Nữ sinh với Nam chính: Xưng 'Em' - Gọi 'Anh' (hoặc 'Cậu/Mình' nếu bạn bè).\n"
-    "• Nữ sinh với nhau: Xưng 'Tớ/Mình' - Gọi 'Cậu'.\n"
-    "• Kẻ địch / Xung đột: Xưng 'Tao' - Gọi 'Mày' hoặc 'Tôi - Cô'.\n"
-    "• Giữ nguyên hậu tố Nhật (-san, -kun, -chan, -senpai) nếu có.\n\n"
-
-    "=== CẢM XÚC & NHỊP ĐIỆU ===\n"
-    "• …… (6 dấu chấm) → Giữ nguyên '……'. Không rút ngắn thành '...'.\n"
-    "• —— (Gạch ngang dài) → Giữ nguyên để thể hiện câu bị cắt ngang.\n"
-    "• Cảm thán: ああ → À…/Ồ… | くそ → Chết tiệt/Khốn kiếp | まあ → Thôi thì…/Chà…\n\n"
-
-    "=== THUẬT NGỮ CỐ ĐỊNH ===\n"
-    "• 戦術機 → Chiến Thuật Cơ | MG → MG | メイズシフター → Maze Shifter\n"
-    "• 生徒会 → Hội Học Sinh | 風紀委員 → Ban Kỷ Luật\n"
+    "You are a professional Japanese-to-Vietnamese Visual Novel translator for Muv-Luv Girls Garden.\n\n"
+    "STRICT OUTPUT RULES:\n"
+    "- Return ONLY a valid JSON array of strings. NO markdown, NO extra text outside JSON.\n"
+    "- Return EXACTLY N strings for N inputs. Do NOT merge, split, or skip any line.\n"
+    "- Do NOT use double quotes (\") inside translated strings. Use single quotes or no quotes.\n"
+    "- Do NOT add character names at the start of translations.\n"
+    "- Output MUST be in Vietnamese. Do NOT output Japanese.\n\n"
+    "TRANSLATION:\n"
+    "- Natural Vietnamese, not word-for-word. Avoid passive voice.\n"
+    "- Keep: ...... -- <r=...>...</r> %placeholder%\n\n"
+    "PRONOUNS: Male lead (Ore)='Toi'. Girls to male='Em/Anh'. Girls together='To/Cau'. Enemy='Tao/May'.\n"
+    "Keep Japanese suffixes: -san, -kun, -chan, -senpai\n"
+    "TERMS: Chien Thuat Co | MG | Maze Shifter | Hoi Hoc Sinh | Ban Ky Luat\n"
 )
 
-# Dành cho tweety (Trung → Việt, phong cách mạng xã hội)
+PROMPT_SCENE_SINGLE = (
+    "You are a Japanese-to-Vietnamese Visual Novel translator for Muv-Luv Girls Garden.\n"
+    "Translate the ONE Japanese string in the input array into Vietnamese.\n"
+    "OUTPUT: Exactly 1-element JSON array. Example: [\"Ban dich o day\"]\n"
+    "- Output MUST be Vietnamese. NEVER output Japanese.\n"
+    "- Do NOT use double quotes inside the string. Use single quotes if needed.\n"
+    "- Keep: ...... -- <r=...>...</r> %placeholder%\n"
+    "PRONOUNS: Ore='Toi'. Girls to male='Em/Anh'. Girls together='To/Cau'.\n"
+    "TERMS: Chien Thuat Co | MG | Maze Shifter | Hoi Hoc Sinh | Ban Ky Luat\n"
+)
+
 PROMPT_TWEETY = (
-    "Bạn là dịch giả game chuyên nghiệp (Trung → Việt) cho 'Muv-Luv Girls Garden'.\n\n"
-
-    "=== OUTPUT FORMAT (TUYỆT ĐỐI TUÂN THỦ) ===\n"
-    "• Trả về ĐÚNG định dạng JSON Array chứa các chuỗi String. KHÔNG thêm text ngoài JSON.\n"
-    "• Trả về đúng N phần tử cho N input. Không thêm, không bớt.\n"
-    "• KHÔNG dùng dấu nháy kép (\") bên trong câu để tránh lỗi JSON.\n\n"
-
-    "=== QUY TẮC BẮT BUỘC ===\n"
-    "• GIỮ NGUYÊN '\\\\n' — đây là ký tự xuống dòng trong game, KHÔNG xoá hay thay thế.\n"
-    "• GIỮ NGUYÊN các @mention (ví dụ: ＠T_Commander, ＠Aoi_I).\n"
-    "• GIỮ NGUYÊN %usernameusernameuserna% và mọi placeholder dạng %...%.\n"
-    "• GIỮ NGUYÊN tên nhân vật/đội tiếng Anh: Sirius Sugar, Colorful Bouquet, Treble Quintet, v.v.\n\n"
-
-    "=== PHONG CÁCH DỊCH ===\n"
-    "• Dịch tự nhiên, trẻ trung theo phong cách mạng xã hội (Twitter/Tweety).\n"
-    "• Giữ cảm xúc, biểu cảm gốc: ~ ♪ ♥ ！ ？ các ký hiệu đặc biệt → GIỮ NGUYÊN.\n"
-    "• Xưng hô nữ sinh với nhau: 'Tớ/Mình' - 'Cậu'. Với chỉ huy (T_Commander): 'Em/Anh'.\n\n"
-
-    "=== THUẬT NGỮ CỐ ĐỊNH ===\n"
-    "• MG → MG | メイズ/迷宫 → Maze | 戦術機/战术机甲 → Chiến Thuật Cơ\n"
-    "• 生徒会/学生会 → Hội Học Sinh | 风纪委员 → Ban Kỷ Luật\n"
+    "You are a Japanese-to-Vietnamese translator for Muv-Luv Girls Garden (social media Tweety).\n\n"
+    "STRICT OUTPUT RULES:\n"
+    "- Return ONLY a valid JSON array of strings. NO extra text.\n"
+    "- Return EXACTLY N strings for N inputs.\n"
+    "- Do NOT use double quotes (\") inside strings.\n"
+    "- Output MUST be Vietnamese. NEVER output Japanese.\n\n"
+    "MANDATORY KEEP (do not translate these):\n"
+    "- Token <<NL>> = in-game line break. Output MUST preserve <<NL>> exactly.\n"
+    "- @mentions: @T_Commander, @Aoi_I, @Julia_B, @Flute_M, etc.\n"
+    "- %usernameusernameuserna% and all %...% placeholders.\n"
+    "- English team names: Sirius Sugar, Colorful Bouquet, Treble Quintet, etc.\n"
+    "- Symbols: ~ (note) (heart) ! ?\n\n"
+    "STYLE: Natural, youthful social-media tone.\n"
+    "Girls use 'To/Minh'/'Cau'. With T_Commander: 'Em/Anh'.\n"
+    "TERMS: MG | Maze | Chien Thuat Co | Hoi Hoc Sinh | Ban Ky Luat\n"
 )
 
-# Dành cho titles/names (Trung → Việt, danh từ/tên riêng)
+PROMPT_TWEETY_SINGLE = (
+    "Translate ONE Japanese Tweety post to Vietnamese.\n"
+    "OUTPUT: Exactly 1-element JSON array.\n"
+    "- Output MUST be Vietnamese. NEVER output Japanese.\n"
+    "- Do NOT use double quotes inside the string.\n"
+    "- KEEP <<NL>> token exactly as-is (it is a line break).\n"
+    "- KEEP @mentions, %placeholder%, English team names, symbols ~ ! ?\n"
+    "- Girls: 'To/Minh'/'Cau'. With @T_Commander: 'Em/Anh'.\n"
+    "TERMS: MG | Maze | Chien Thuat Co\n"
+)
+
 PROMPT_DICT = (
-    "Bạn là biên dịch viên game (Trung → Việt) cho 'Muv-Luv Girls Garden'.\n\n"
-
-    "=== OUTPUT FORMAT (TUYỆT ĐỐI TUÂN THỦ) ===\n"
-    "• Trả về ĐÚNG định dạng JSON Array chứa các chuỗi String.\n"
-    "• Trả về đúng N phần tử cho N input. Không thêm, không bớt.\n\n"
-
-    "=== QUY TẮC BẮT BUỘC ===\n"
-    "• GIỮ NGUYÊN thẻ Rich Text: <color=#...>, </material>, </color> và nội dung bên trong nếu là tên tiếng Anh.\n"
-    "• GIỮ NGUYÊN %usernameusernameuserna% và mọi placeholder dạng %...%.\n"
-    "• GIỮ NGUYÊN '\\\\r\\\\n' ở cuối chuỗi nếu có.\n"
-    "• GIỮ NGUYÊN tên đội/nhóm tiếng Anh: Sirius Sugar, Colorful Bouquet, Treble Quintet, Chaos Maiden, Pre Class-A, Pyxis Ma Soeur, Inscarlet, Treble Quintet, Arcturus, Unity Edge, Trinity Jewel.\n"
-    "• GIỮ NGUYÊN tên riêng tiếng Nhật đã phiên âm: các tên như Meru, Naniro, Shirona, Rami, Chiyuru, Aoi, Uruu, Julia, Suiran, Saya, Fii, Anisu, v.v.\n\n"
-
-    "=== QUY TẮC DỊCH ===\n"
-    "• Danh từ chung/tiêu đề: Dịch sang tiếng Việt tự nhiên (VD: '第1节第1话' → 'Tiết 1 Tập 1', '序章第1话' → 'Mở đầu Tập 1').\n"
-    "• Subtitle/mô tả nhân vật: Dịch nghĩa, giữ sắc thái (VD: '[笨拙又纯真的未来王牌]' → '[Cô gái vụng về nhưng thuần khiết, Át chủ bài tương lai]').\n"
-    "• Tên NPC/nhân vật phụ: Dịch mô tả sang tiếng Việt (VD: '声音沙哑的教师' → 'Giáo viên giọng khàn khàn').\n"
-    "• 学生会 → Hội Học Sinh | 风纪委员 → Ban Kỷ Luật | 指挥官 → Chỉ huy\n"
-    "• Chuỗi rỗng '' → Giữ nguyên chuỗi rỗng ''.\n"
-    "• '--' → Giữ nguyên '--'.\n"
+    "You are a Japanese-to-Vietnamese game translator for Muv-Luv Girls Garden.\n\n"
+    "STRICT OUTPUT RULES:\n"
+    "- Return ONLY a valid JSON array of strings. NO extra text.\n"
+    "- Return EXACTLY N strings for N inputs.\n"
+    "- Output MUST be Vietnamese.\n\n"
+    "MANDATORY KEEP:\n"
+    "- Rich Text tags: <color=#...> </material> </color>\n"
+    "- Placeholders: %...%\n"
+    "- English team names: Sirius Sugar, Colorful Bouquet, Treble Quintet, Chaos Maiden, Pre Class-A, Pyxis Ma Soeur, Inscarlet, Arcturus, Unity Edge, Trinity Jewel.\n"
+    "- Empty string or '--' -> keep as-is.\n\n"
+    "TRANSLATE: titles, chapter names, character descriptions in [...], NPC names.\n"
+    "TERMS: Hoi Hoc Sinh | Ban Ky Luat | Chi huy\n"
 )
 
 
 # ==========================================
-# CORE LOGIC
+# API CALL — SMART RETRY 4 TANG
 # ==========================================
 
-def call_gemini(text_list, prompt):
-    """Gọi API với kiểm tra số lượng phần tử trả về."""
+def _call_once(text_list, prompt, temperature=0.3):
+    clean   = [sanitize(t) for t in text_list]
+    payload = json.dumps(clean, ensure_ascii=False)
+    resp    = client.models.generate_content(
+        model=MODEL_ID,
+        contents=payload,
+        config=types.GenerateContentConfig(
+            system_instruction=prompt,
+            response_mime_type="application/json",
+            temperature=temperature,
+        )
+    )
+    raw    = repair_json(resp.text)
+    result = json.loads(raw)
+    if not isinstance(result, list):
+        raise ValueError(f"Not a list: {type(result)}")
+    if len(result) != len(text_list):
+        raise ValueError(f"Mismatch: In={len(text_list)} Out={len(result)}")
+    # Kiem tra moi phan tu: neu con tieng Nhat = chua dich
+    for i, val in enumerate(result):
+        if still_untranslated(str(val)):
+            raise ValueError(f"Untranslated at [{i}]: {repr(str(val)[:40])}")
+    return result
+
+
+def call_gemini(text_list, prompt, single_prompt=None):
+    """
+    Smart retry 4 tang:
+      Tang 1-2 : Retry nguyen batch
+      Tang 3   : Chia doi batch, goi de quy
+      Tang 4   : Fallback tung dong voi single_prompt va nhiet do tang dan
+    """
     if not text_list:
         return []
-    payload = json.dumps(text_list, ensure_ascii=False)
 
-    for attempt in range(MAX_RETRIES):
+    # Tang 1 & 2
+    for attempt in range(2):
         try:
-            response = client.models.generate_content(
-                model=MODEL_ID,
-                contents=payload,
-                config=types.GenerateContentConfig(
-                    system_instruction=prompt,
-                    response_mime_type="application/json",
-                    temperature=0.5,
-                )
-            )
-            result = json.loads(response.text)
-            if len(result) != len(text_list):
-                raise ValueError(f"Mismatch: In {len(text_list)} vs Out {len(result)}")
-            return result
+            return _call_once(text_list, prompt)
         except Exception as e:
-            if attempt == MAX_RETRIES - 1:
-                print(f"    [!] Lỗi API: {e}")
-                return None
-            time.sleep(1)
-    return None
+            print(f"    [!] Loi (lan {attempt+1}, {len(text_list)} dong): {e}")
+            time.sleep(2)
 
+    # Tang 3: chia doi
+    if len(text_list) > 1:
+        mid   = len(text_list) // 2
+        print(f"    [~] Chia doi: {len(text_list)} -> {mid}+{len(text_list)-mid}")
+        left  = call_gemini(text_list[:mid], prompt, single_prompt)
+        right = call_gemini(text_list[mid:], prompt, single_prompt)
+        if left is not None and right is not None:
+            return left + right
+
+    # Tang 4: tung dong mot voi nhiet do tang dan
+    sp = single_prompt or prompt
+    print(f"    [~] Fallback tung dong ({len(text_list)} dong)...")
+    results = []
+    for i, item in enumerate(text_list):
+        translated = None
+        temps = [0.3, 0.5, 0.7, 0.9]  # tang nhiet do moi lan retry
+        for t_idx, temp in enumerate(temps):
+            try:
+                res = _call_once([item], sp, temperature=temp)
+                val = res[0]
+                # _call_once da validate roi, neu den day la OK
+                translated = val
+                break
+            except Exception as e:
+                if t_idx < len(temps) - 1:
+                    time.sleep(1 + t_idx)
+                else:
+                    print(f"    [X] Giu nguyen dong {i}: {repr(str(item)[:50])}")
+        results.append(translated if translated is not None else item)
+    return results
+
+
+# ==========================================
+# PROCESSORS
+# ==========================================
 
 def process_scene_file(dir_path):
-    """Xử lý scene files: xoá newline trước khi gửi API."""
     source = os.path.join(dir_path, "zh_Hans.json")
     target = os.path.join(dir_path, "vi_VN.json")
-
     if os.path.exists(target):
         return
 
     try:
-        with open(source, 'r', encoding='utf-8') as f:
+        with open(source, encoding='utf-8') as f:
             data = json.load(f)
 
-        keys_to_translate = list(data.keys())
-        if not keys_to_translate:
+        keys = list(data.keys())
+        if not keys:
             return
 
-        # Xoá \n trước khi gửi AI (Unity không hỗ trợ newline trong scene)
-        cleaned_texts = []
-        for k in keys_to_translate:
-            clean_k = k.replace('\\n', ' ').replace('\n', ' ')
-            cleaned_texts.append(clean_k)
+        clean_keys = [k.replace('\\n', ' ').replace('\n', ' ') for k in keys]
 
-        translated_vals = []
-        batch_size = 200
-        batches = [cleaned_texts[i:i + batch_size] for i in range(0, len(cleaned_texts), batch_size)]
+        translated = []
+        BATCH = 80
+        for i in range(0, len(clean_keys), BATCH):
+            batch = clean_keys[i:i + BATCH]
+            res   = call_gemini(batch, PROMPT_SCENE, PROMPT_SCENE_SINGLE)
+            translated.extend([v.replace('\\n', ' ').replace('\n', ' ') for v in res])
 
-        for batch in batches:
-            res = call_gemini(batch, PROMPT_SCENE)
-            if res:
-                clean_res = [v.replace('\\n', ' ').replace('\n', ' ') for v in res]
-                translated_vals.extend(clean_res)
-            else:
-                translated_vals.extend(batch)
-
-        target_data = {}
-        for i, original_key in enumerate(keys_to_translate):
-            target_data[original_key] = translated_vals[i] if i < len(translated_vals) else original_key
+        out = {keys[i]: (translated[i] if i < len(translated) else keys[i])
+               for i in range(len(keys))}
 
         with open(target, 'w', encoding='utf-8') as f:
-            json.dump(target_data, f, ensure_ascii=False, indent=4)
+            json.dump(out, f, ensure_ascii=False, indent=4)
 
-        print(f"[Scenes] Xong: {os.path.basename(dir_path)} ({len(keys_to_translate)} dòng)")
+        print(f"[Scenes] Xong: {os.path.basename(dir_path)} ({len(keys)} dong)")
 
     except Exception as e:
-        print(f"[!] Lỗi tại {dir_path}: {e}")
+        print(f"[!] Loi Scenes {os.path.basename(dir_path)}: {e}")
 
 
 def process_tweety_file(dir_path):
-    """
-    Xử lý tweety/zh_Hans.json.
-    Cấu trúc: { "tweetyPosts": { japanese_key: chinese_value, ... } }
-    - Dịch KEY tiếng Nhật → Việt, đặt làm value trong vi_VN.json
-    - GIỮ NGUYÊN \\n trong key (xuống dòng bài đăng mạng xã hội)
-    - GIỮ NGUYÊN @mention và %placeholder%
-    """
     source = os.path.join(dir_path, "zh_Hans.json")
     target = os.path.join(dir_path, "vi_VN.json")
-
     if os.path.exists(target):
         return
 
-    print(f"[Tweety] Đang xử lý: {dir_path}")
+    print(f"[Tweety] Xu ly: {dir_path}")
     try:
-        with open(source, 'r', encoding='utf-8') as f:
+        with open(source, encoding='utf-8') as f:
             data = json.load(f)
 
+        NL = "<<NL>>"
         final_data = {}
 
         for category, sub_dict in data.items():
@@ -213,123 +269,106 @@ def process_tweety_file(dir_path):
                 final_data[category] = sub_dict
                 continue
 
-            # Dịch từ KEY tiếng Nhật sang Việt
-            all_keys = list(sub_dict.keys())
+            orig_keys = list(sub_dict.keys())
+            send_keys = [k.replace("\\n", NL) for k in orig_keys]
 
             trans_map = {}
-            batch_size = 80
-            batches = [all_keys[i:i + batch_size] for i in range(0, len(all_keys), batch_size)]
+            BATCH = 20
+            for i in range(0, len(send_keys), BATCH):
+                batch = send_keys[i:i + BATCH]
+                res   = call_gemini(batch, PROMPT_TWEETY, PROMPT_TWEETY_SINGLE)
+                for sk, tr in zip(batch, res):
+                    # Kiem tra <<NL>> con nguyen khong
+                    expected_nl = sk.count(NL)
+                    if expected_nl > 0 and tr.count(NL) == 0:
+                        print(f"    [~] <<NL>> bi mat, retry 1 dong...")
+                        retry = call_gemini([sk], PROMPT_TWEETY_SINGLE, PROMPT_TWEETY_SINGLE)
+                        tr = retry[0] if retry else sk
+                    trans_map[sk] = tr.replace(NL, "\\n")
 
-            for batch in batches:
-                res = call_gemini(batch, PROMPT_TWEETY)
-                if res:
-                    for origin, trans in zip(batch, res):
-                        trans_map[origin] = trans
-                else:
-                    for origin in batch:
-                        trans_map[origin] = origin
-
-            # Key gốc (Nhật) giữ nguyên, value = bản dịch Việt
-            translated_sub = {k: trans_map.get(k, k) for k in all_keys}
-            final_data[category] = translated_sub
+            final_data[category] = {
+                ok: trans_map.get(sk, ok)
+                for ok, sk in zip(orig_keys, send_keys)
+            }
 
         with open(target, 'w', encoding='utf-8') as f:
             json.dump(final_data, f, ensure_ascii=False, indent=4)
 
         total = sum(len(v) for v in final_data.values() if isinstance(v, dict))
-        print(f"[Tweety] Hoàn tất! ({total} bài đăng)")
+        print(f"[Tweety] Hoan tat! ({total} bai dang)")
 
     except Exception as e:
-        print(f"[Tweety] Lỗi: {e}")
+        print(f"[Tweety] Loi: {e}")
 
 
 def process_nested_file(dir_path):
-    """
-    Xử lý titles/zh_Hans.json và names/zh_Hans.json.
-    Cấu trúc: { "category": { japanese_key: chinese_value, ... }, ... }
-    - Dịch KEY tiếng Nhật → Việt, đặt làm value trong vi_VN.json
-    - GIỮ NGUYÊN Rich Text tags trong key nếu có
-    - Bỏ qua chuỗi đặc biệt không cần dịch: '', '--', '？？？'
-    """
     source = os.path.join(dir_path, "zh_Hans.json")
     target = os.path.join(dir_path, "vi_VN.json")
-
     if os.path.exists(target):
         return
 
-    folder_name = os.path.basename(dir_path)
-    print(f"[{folder_name}] Đang xử lý: {dir_path}")
+    folder = os.path.basename(dir_path)
+    print(f"[{folder}] Xu ly: {dir_path}")
 
     try:
-        with open(source, 'r', encoding='utf-8') as f:
+        with open(source, encoding='utf-8') as f:
             data = json.load(f)
 
-        # Thu thập tất cả KEYS cần dịch, loại bỏ trùng lặp
-        SKIP_KEYS = {'', '--', '？？？', '？？？？'}
-        all_keys = []
-        for category, sub_dict in data.items():
-            if isinstance(sub_dict, dict):
-                all_keys.extend(sub_dict.keys())
-            else:
-                all_keys.append(category)
+        SKIP = {'', '--', '\uff1f\uff1f\uff1f', '\uff1f\uff1f\uff1f\uff1f', '???', '????'}
 
-        unique_keys = list(set(k for k in all_keys if k not in SKIP_KEYS and k.strip()))
+        all_keys = []
+        for cat, sub in data.items():
+            if isinstance(sub, dict):
+                all_keys.extend(sub.keys())
+
+        unique = list(set(k for k in all_keys if k not in SKIP and k.strip()))
 
         trans_map = {}
-        batch_size = 100
-        batches = [unique_keys[i:i + batch_size] for i in range(0, len(unique_keys), batch_size)]
+        BATCH = 80
+        for i in range(0, len(unique), BATCH):
+            batch = unique[i:i + BATCH]
+            res   = call_gemini(batch, PROMPT_DICT)
+            for orig, tr in zip(batch, res):
+                trans_map[orig] = tr
 
-        for batch in batches:
-            res = call_gemini(batch, PROMPT_DICT)
-            if res:
-                for origin, trans in zip(batch, res):
-                    trans_map[origin] = trans
-            else:
-                for origin in batch:
-                    trans_map[origin] = origin
-
-        # Ghép lại cấu trúc gốc: key Nhật giữ nguyên, value = bản dịch Việt
         final_data = {}
-        for category, sub_dict in data.items():
-            if isinstance(sub_dict, dict):
-                final_data[category] = {k: trans_map.get(k, k) for k in sub_dict.keys()}
+        for cat, sub in data.items():
+            if isinstance(sub, dict):
+                final_data[cat] = {k: trans_map.get(k, k) for k in sub.keys()}
             else:
-                final_data[category] = sub_dict
+                final_data[cat] = sub
 
         with open(target, 'w', encoding='utf-8') as f:
             json.dump(final_data, f, ensure_ascii=False, indent=4)
 
-        print(f"[{folder_name}] Hoàn tất!")
+        print(f"[{folder}] Hoan tat!")
 
     except Exception as e:
-        print(f"[{folder_name}] Lỗi: {e}")
+        print(f"[{folder}] Loi: {e}")
 
+
+# ==========================================
+# DISPATCH & MAIN
+# ==========================================
 
 def dispatch(dir_path):
-    """Phân loại folder và gọi hàm xử lý phù hợp."""
-    folder_name = os.path.basename(dir_path).lower()
-
-    if folder_name == "tweety":
-        if os.path.exists(os.path.join(dir_path, "zh_Hans.json")):
-            process_tweety_file(dir_path)
-    elif folder_name in ["names", "titles"]:
-        if os.path.exists(os.path.join(dir_path, "zh_Hans.json")):
-            process_nested_file(dir_path)
+    name = os.path.basename(dir_path).lower()
+    if not os.path.exists(os.path.join(dir_path, "zh_Hans.json")):
+        return
+    if name == "tweety":
+        process_tweety_file(dir_path)
+    elif name in ("names", "titles"):
+        process_nested_file(dir_path)
     else:
-        if os.path.exists(os.path.join(dir_path, "zh_Hans.json")):
-            process_scene_file(dir_path)
+        process_scene_file(dir_path)
 
 
 def main():
-    print("=== TERTIA V9.0 (TWEETY + TITLES + NAMES OPTIMIZED) ===")
-    print("Môi trường: Đã tải GEMINI_API_KEY từ .env")
-
+    print("=== TERTIA V12.0 — VALIDATE OUTPUT + TEMPERATURE ESCALATION ===")
     all_dirs = [x[0] for x in os.walk(ROOT_FOLDER)]
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(dispatch, all_dirs)
-
-    print("\n=== HOÀN TẤT TOÀN BỘ PROJECT ===")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        ex.map(dispatch, all_dirs)
+    print("\n=== HOAN TAT TOAN BO PROJECT ===")
 
 
 if __name__ == "__main__":
